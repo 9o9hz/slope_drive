@@ -37,7 +37,7 @@ class BevProjectionNode(Node):
         self.cam_info_sub = self.create_subscription(
             CameraInfo, '/camera/color/camera_info', self.cam_info_callback, 10)
         self.imu_sub = self.create_subscription(
-            Imu, '/imu/orientation', self.imu_callback, 10)
+            Imu, '/camera/imu', self.imu_callback, 10) # CHANGED: IMU 토픽 변경
 
         # Publishers
         self.bev_image_pub = self.create_publisher(Image, '/bev/image', 10)
@@ -92,27 +92,44 @@ class BevProjectionNode(Node):
 
     def update_homography(self, imu_msg):
         """
-        Step B, C: IMU 데이터와 카메라 파라미터를 이용해 호모그래피 행렬 H(t)를 계산.
+        IMU, 카메라 파라미터를 이용해 호모그래피 행렬 H(t)를 계산.
+        R_world_to_cam = R_base * R_cam_imu * R_imu
+        - Ground Plane (World): X-forward, Y-left, Z-up
+        - Camera Optical Frame: Z-forward, X-right, Y-down
         """
-        # Step B: IMU 자세 적용 (roll/pitch 추출 및 오프셋 적용)
+        # 1. R_imu: IMU가 측정한 월드 좌표계 대비 IMU의 자세
         q = imu_msg.orientation
-        # SciPy를 사용하여 쿼터니언에서 오일러 각도(roll, pitch) 추출
-        imu_rotation = Rotation.from_quat([q.x, q.y, q.z, q.w])
-        roll, pitch, yaw = imu_rotation.as_euler('xyz') # 결과는 라디안
+        R_world_to_imu = Rotation.from_quat([q.x, q.y, q.z, q.w])
 
-        # 카메라 장착 오프셋 적용
-        total_roll = roll + self.roll_offset_rad
-        total_pitch = pitch + self.pitch_offset_rad
+        # 2. R_cam_imu: IMU 좌표계 대비 카메라의 장착 오프셋 (정적 보정)
+        R_imu_to_cam_body = Rotation.from_euler('xyz', [self.roll_offset_rad, self.pitch_offset_rad, 0])
 
-        # Step C: 호모그래피 H(t) 구성
-        # 지면(월드 좌표계) -> 카메라 좌표계로의 변환 행렬 구성
-        R_world_to_cam = Rotation.from_euler('xyz', [total_roll, total_pitch, 0]).as_matrix().T
+        # IMU 자세와 장착 오프셋을 결합하여 월드 좌표계 대비 카메라 몸체의 자세 계산
+        R_world_to_cam_body = R_imu_to_cam_body * R_world_to_imu
+
+        # 3. R_base: 카메라 몸체 좌표계(X-fwd, Y-left, Z-up)를
+        #    카메라 광학 좌표계(Z-fwd, X-right, Y-down)로 변환하는 정적 회전
+        R_body_to_optical = Rotation.from_matrix(
+            [[0., -1., 0.],
+             [0.,  0.,-1.],
+             [1.,  0., 0.]]
+        )
+
+        # 최종적으로 월드(지면) 좌표계에서 카메라 광학 좌표계로의 회전 계산
+        R_world_to_cam_optical = R_body_to_optical * R_world_to_cam_body
+
+        # 호모그래피 계산을 위해 Scipy Rotation 객체를 Numpy 행렬로 변환.
+        # 좌표계 변환(Passive rotation)을 위해 전치 행렬(.T)을 사용.
+        R = R_world_to_cam_optical.as_matrix().T
+
+        # 카메라의 월드 좌표계상 위치 벡터 [x, y, z]
         t_cam_in_world = np.array([0, 0, self.camera_height])
-        t_world_to_cam = -R_world_to_cam @ t_cam_in_world
+        # 월드 -> 카메라 좌표계로의 이동 벡터 계산
+        t_vec = -R @ t_cam_in_world
 
         # 지면(z=0)에서 이미지 평면으로의 호모그래피 H_g2i 계산
-        R_wc = R_world_to_cam
-        H_g2i = self.camera_matrix @ np.hstack((R_wc[:, 0:1], R_wc[:, 1:2], t_world_to_cam.reshape(3,1)))
+        # H = K @ [r1 r2 t]
+        H_g2i = self.camera_matrix @ np.hstack((R[:, 0:1], R[:, 1:2], t_vec.reshape(3,1)))
 
         try:
             # 이미지 평면 -> 지면으로의 역변환 H(t) 계산
