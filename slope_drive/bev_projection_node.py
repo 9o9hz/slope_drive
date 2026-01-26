@@ -1,13 +1,35 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Image, CameraInfo, Imu
 from std_msgs.msg import Float64MultiArray
 import cv2
+import numpy as np
+from cv_bridge import CvBridge
+from scipy.spatial.transform import Rotation
 
 class BevProjectionNode(Node):
     def __init__(self):
         super().__init__('bev_projection_node')
         self.get_logger().info('BEV Projection Node has been started.')
+
+        # CvBridge 초기화
+        self.bridge = CvBridge()
+
+        # 파라미터 선언 (카메라 높이, 오프셋, BEV 크기 등)
+        self.declare_parameters(
+            namespace='',
+            parameters=[
+                ('camera_height_m', 0.5), # 지면으로부터 카메라 렌즈까지의 높이 (미터)
+                ('camera_pitch_offset_deg', 10.0), # 카메라가 아래를 보는 각도 (양수 값)
+                ('camera_roll_offset_deg', 0.0), # 카메라의 수평 기울기 오프셋
+                ('bev_img_width', 400), # BEV 이미지의 너비 (픽셀)
+                ('bev_img_height', 400), # BEV 이미지의 높이 (픽셀)
+                ('bev_meters_per_pixel', 0.05) # BEV 이미지에서 1픽셀이 나타내는 실제 거리 (미터)
+            ])
+        self.load_parameters()
+        self.add_on_set_parameters_callback(self.parameters_callback)
 
         # Subscribers
         self.image_sub = self.create_subscription(
@@ -22,36 +44,125 @@ class BevProjectionNode(Node):
         self.homography_pub = self.create_publisher(Float64MultiArray, '/bev/H', 10)
         self.debug_image_pub = self.create_publisher(Image, '/bev/debug_overlay', 10)
 
+        # 클래스 변수 초기화
         self.camera_matrix = None
         self.dist_coeffs = None
+        self.latest_imu_msg = None
+        self.image_to_ground_homography = None # H(t)
 
-    def image_callback(self, msg):
-        if self.camera_matrix is None:
-            self.get_logger().warn('Camera info not received yet. Skipping image processing.')
-            return
-            
-        self.get_logger().info(f'Received Image: {msg.header.stamp}')
-        # Placeholder for BEV projection logic
-        # You will use self.camera_matrix, self.dist_coeffs and IMU data
-        # to calculate the homography matrix H(t) and warp the input image.
+    def load_parameters(self):
+        """선언된 파라미터 로드"""
+        self.camera_height = self.get_parameter('camera_height_m').value
+        self.pitch_offset_rad = np.deg2rad(self.get_parameter('camera_pitch_offset_deg').value)
+        self.roll_offset_rad = np.deg2rad(self.get_parameter('camera_roll_offset_deg').value)
+        self.bev_width = self.get_parameter('bev_img_width').value
+        self.bev_height = self.get_parameter('bev_img_height').value
+        self.mpp = self.get_parameter('bev_meters_per_pixel').value
+        self.get_logger().info("Parameters loaded.")
 
-        # For now, let's just create a dummy black image as BEV
-        dummy_bev_image = cv2.cvtColor(cv2.UMat(200, 200, cv2.CV_8UC1, 0), cv2.COLOR_GRAY2BGR)
-        # In a real scenario, you'd publish the warped image
-        # self.bev_image_pub.publish(bev_image_msg)
+    def parameters_callback(self, params):
+        """파라미터 동적 변경 콜백"""
+        for param in params:
+            if param.name == 'camera_height_m':
+                self.camera_height = param.value
+            elif param.name == 'camera_pitch_offset_deg':
+                self.pitch_offset_rad = np.deg2rad(param.value)
+            # ... 다른 파라미터들도 동일하게 처리
+        self.get_logger().info("Parameters updated.")
+        # 파라미터 변경 시 호모그래피 행렬을 다시 계산
+        if self.latest_imu_msg is not None:
+            self.update_homography(self.latest_imu_msg)
+        return SetParametersResult(successful=True)
+
 
     def cam_info_callback(self, msg):
-        self.get_logger().info('Received camera info.')
-        self.camera_matrix = msg.k.reshape((3, 3))
-        self.dist_coeffs = msg.d
-        # Unregister subscription to save resources as camera info is static
-        self.destroy_subscription(self.cam_info_sub)
-
+        """카메라 정보 콜백. 한 번만 수신하고 구독 해제."""
+        if self.camera_matrix is None:
+            self.get_logger().info('Received camera info.')
+            self.camera_matrix = np.array(msg.k).reshape((3, 3))
+            self.dist_coeffs = np.array(msg.d)
+            self.destroy_subscription(self.cam_info_sub)
+            self.get_logger().info('Camera info subscription destroyed.')
 
     def imu_callback(self, msg):
-        # This is where you would update the dynamic part of your homography matrix
-        # based on the vehicle's orientation (roll, pitch).
-        self.get_logger().info(f'Received IMU Orientation: {msg.header.stamp}')
+        """IMU 데이터 콜백. H(t)를 업데이트."""
+        self.latest_imu_msg = msg
+        if self.camera_matrix is not None:
+            self.update_homography(msg)
+
+    def update_homography(self, imu_msg):
+        """
+        Step B, C: IMU 데이터와 카메라 파라미터를 이용해 호모그래피 행렬 H(t)를 계산.
+        """
+        # Step B: IMU 자세 적용 (roll/pitch 추출 및 오프셋 적용)
+        q = imu_msg.orientation
+        # SciPy를 사용하여 쿼터니언에서 오일러 각도(roll, pitch) 추출
+        imu_rotation = Rotation.from_quat([q.x, q.y, q.z, q.w])
+        roll, pitch, yaw = imu_rotation.as_euler('xyz') # 결과는 라디안
+
+        # 카메라 장착 오프셋 적용
+        total_roll = roll + self.roll_offset_rad
+        total_pitch = pitch + self.pitch_offset_rad
+
+        # Step C: 호모그래피 H(t) 구성
+        # 지면(월드 좌표계) -> 카메라 좌표계로의 변환 행렬 구성
+        R_world_to_cam = Rotation.from_euler('xyz', [total_roll, total_pitch, 0]).as_matrix().T
+        t_cam_in_world = np.array([0, 0, self.camera_height])
+        t_world_to_cam = -R_world_to_cam @ t_cam_in_world
+
+        # 지면(z=0)에서 이미지 평면으로의 호모그래피 H_g2i 계산
+        R_wc = R_world_to_cam
+        H_g2i = self.camera_matrix @ np.hstack((R_wc[:, 0:1], R_wc[:, 1:2], t_world_to_cam.reshape(3,1)))
+
+        try:
+            # 이미지 평면 -> 지면으로의 역변환 H(t) 계산
+            self.image_to_ground_homography = np.linalg.inv(H_g2i)
+        except np.linalg.LinAlgError:
+            self.get_logger().warn('Failed to compute inverse of homography matrix.')
+            self.image_to_ground_homography = None
+
+    def image_callback(self, msg):
+        """이미지 콜백. 왜곡 보정, BEV 변환 및 퍼블리시 수행."""
+        if self.camera_matrix is None or self.dist_coeffs is None:
+            self.get_logger().warn('Camera info not received yet. Skipping image processing.')
+            return
+
+        if self.image_to_ground_homography is None:
+            self.get_logger().warn('Homography matrix not computed yet. Skipping image processing.')
+            return
+
+        # ROS 이미지를 OpenCV 이미지로 변환
+        cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+
+        # Step A: 왜곡 보정
+        undistorted_image = cv2.undistort(cv_image, self.camera_matrix, self.dist_coeffs)
+
+        # Step D: warpPerspective로 BEV 생성
+        # 미터 단위를 BEV 이미지의 픽셀 단위로 변환하는 행렬 M 구성
+        # 차량 바로 앞 지면(0,0)이 BEV 이미지의 (width/2, height)에 오도록 설정
+        M = np.array([
+            [1/self.mpp, 0, self.bev_width / 2],
+            [0, -1/self.mpp, self.bev_height], # Y축 방향을 뒤집어 이미지 위쪽이 전방이 되도록 함
+            [0, 0, 1]
+        ])
+
+        # 최종 변환 행렬 (이미지 -> BEV)
+        final_homography = M @ self.image_to_ground_homography
+        
+        # BEV 이미지 생성
+        bev_size = (self.bev_width, self.bev_height)
+        bev_image = cv2.warpPerspective(undistorted_image, final_homography, bev_size, flags=cv2.INTER_LINEAR)
+
+        # BEV 이미지 퍼블리시
+        bev_msg = self.bridge.cv2_to_imgmsg(bev_image, "bgr8")
+        bev_msg.header = msg.header
+        self.bev_image_pub.publish(bev_msg)
+
+        # (Optional) 디버그용 이미지 및 호모그래피 행렬 퍼블리시
+        self.debug_image_pub.publish(self.bridge.cv2_to_imgmsg(undistorted_image, "bgr8"))
+        h_msg = Float64MultiArray()
+        h_msg.data = final_homography.flatten().tolist()
+        self.homography_pub.publish(h_msg)
 
 def main(args=None):
     rclpy.init(args=args)
