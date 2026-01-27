@@ -26,6 +26,8 @@ setup(
             'bev_projection_node = slope_drive.bev_projection_node:main',
             'edge_lane_node = slope_drive.edge_lane_node:main',
             'path_planner_node = slope_drive.path_planner_node:main',
+            'skeletonization_node = slope_drive.skeletonization_node:main',
+            'branch_pruning_node = slope_drive.branch_pruning_node:main',
         ],
     },
 )
