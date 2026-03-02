@@ -1,6 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from rcl_interfaces.msg import SetParametersResult
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, CameraInfo, Imu
 from std_msgs.msg import Float64MultiArray
 import cv2
@@ -31,11 +32,11 @@ class BevProjectionNode(Node):
 
         # Subscribers
         self.image_sub = self.create_subscription(
-            Image, '/camera_node/color/image_raw', self.image_callback, 10)
+            Image, '/camera/camera/color/image_raw', self.image_callback, qos_profile_sensor_data)
         self.cam_info_sub = self.create_subscription(
-            CameraInfo, '/camera_node/color/camera_info', self.cam_info_callback, 10)
+            CameraInfo, '/camera/camera/color/camera_info', self.cam_info_callback, qos_profile_sensor_data)
         self.imu_sub = self.create_subscription(
-            Imu, '/camera_node/imu', self.imu_callback, 10)
+            Imu, '/camera/camera/imu', self.imu_callback, qos_profile_sensor_data)
 
         # Publishers
         self.bev_image_pub = self.create_publisher(Image, '/bev/image', 10)
@@ -98,6 +99,11 @@ class BevProjectionNode(Node):
 
     def image_callback(self, msg):
         if self.camera_matrix is None or self.image_to_ground_homography is None:
+            self.get_logger().warn(
+                f'Waiting for data... CamInfo: {self.camera_matrix is not None}, '
+                f'Homography: {self.image_to_ground_homography is not None}',
+                throttle_duration_sec=2.0
+            )
             return
 
         cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")

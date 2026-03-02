@@ -1,5 +1,6 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Imu
 
 class ImuOrientationNode(Node):
@@ -9,9 +10,9 @@ class ImuOrientationNode(Node):
 
         self.imu_subscriber = self.create_subscription(
             Imu,
-            '/camera/imu',
+            '/camera/camera/imu',
             self.imu_callback,
-            10)
+            qos_profile_sensor_data)
 
         self.orientation_publisher = self.create_publisher(
             Imu,

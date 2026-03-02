@@ -33,6 +33,11 @@ class VisualizerNode(Node):
     def show_image(self):
         if self.bev_img is not None:
             cv2.imshow("BEV Input", self.bev_img)
+        else:
+            # 데이터가 아직 안 들어왔을 때 대기 화면 표시
+            wait_img = np.zeros((400, 400, 3), dtype=np.uint8)
+            cv2.putText(wait_img, "Waiting for Topic...", (50, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.imshow("BEV Input", wait_img)
         
         if self.skel_img is not None:
             # 흑백 이미지를 컬러로 변환해서 빨간색으로 표시
@@ -45,6 +50,11 @@ class VisualizerNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = VisualizerNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cv2.destroyAllWindows()
+        node.destroy_node()
+        rclpy.shutdown()
